@@ -1,0 +1,131 @@
+--Getting all the databases and making a cursor
+DECLARE db_cursor CURSOR FOR  
+SELECT name 
+FROM master.dbo.sysdatabases 
+WHERE name NOT IN ('master','model','msdb','tempdb')  -- exclude these databases
+
+DECLARE @databaseName nvarchar(1000)
+--opening the cursor to move over the databases in this instance
+OPEN db_cursor
+FETCH NEXT FROM db_cursor INTO @databaseName   
+
+WHILE @@FETCH_STATUS = 0   
+BEGIN
+    PRINT @databaseName
+    --Setting up temp table for the results of our search
+    DECLARE @Results TABLE(TableName nvarchar(370), RealColumnName nvarchar(370), ColumnName nvarchar(370), ColumnValue nvarchar(3630))
+
+    SET NOCOUNT ON
+
+    DECLARE @SearchStr nvarchar(100), @ReplaceStr nvarchar(100), @SearchStr2 nvarchar(110)
+    SET @SearchStr = 'Search String'
+    SET @ReplaceStr = 'Replace String'
+    SET @SearchStr2 = QUOTENAME('%' + @SearchStr + '%','''')
+
+    DECLARE @TableName nvarchar(256), @ColumnName nvarchar(128)
+    SET  @TableName = ''
+
+    --Looping over all the tables in the database
+    WHILE @TableName IS NOT NULL
+    BEGIN
+        DECLARE @SQL nvarchar(2000)
+        SET @ColumnName = ''
+        DECLARE @result NVARCHAR(256)
+        SET @SQL = 'USE ' + @databaseName + '
+            SELECT @result = MIN(QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME))
+            FROM    [' + @databaseName + '].INFORMATION_SCHEMA.TABLES
+            WHERE       TABLE_TYPE = ''BASE TABLE'' AND TABLE_CATALOG = ''' + @databaseName + '''
+                AND QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME) > ''' + @TableName + '''
+                AND OBJECTPROPERTY(
+                        OBJECT_ID(
+                            QUOTENAME(TABLE_SCHEMA) + ''.'' + QUOTENAME(TABLE_NAME)
+                                ), ''IsMSShipped''
+                                ) = 0'
+        EXEC master..sp_executesql @SQL, N'@result nvarchar(256) out', @result out
+
+        SET @TableName = @result
+        PRINT @TableName
+
+        WHILE (@TableName IS NOT NULL) AND (@ColumnName IS NOT NULL)
+        BEGIN
+            DECLARE @ColumnResult NVARCHAR(256)
+            SET @SQL = '
+                SELECT @ColumnResult = MIN(QUOTENAME(COLUMN_NAME))
+                FROM    [' + @databaseName + '].INFORMATION_SCHEMA.COLUMNS
+                WHERE       TABLE_SCHEMA    = PARSENAME(''[' + @databaseName + '].' + @TableName + ''', 2)
+                    AND TABLE_NAME  = PARSENAME(''[' + @databaseName + '].' + @TableName + ''', 1)
+                    AND DATA_TYPE IN (''char'', ''varchar'', ''nchar'', ''nvarchar'')
+                    AND TABLE_CATALOG = ''' + @databaseName + '''
+                    AND QUOTENAME(COLUMN_NAME) > ''' + @ColumnName + ''''
+            PRINT @SQL
+            EXEC master..sp_executesql @SQL, N'@ColumnResult nvarchar(256) out', @ColumnResult out
+            SET @ColumnName = @ColumnResult 
+
+            PRINT @ColumnName
+
+            IF @ColumnName IS NOT NULL
+            BEGIN
+                INSERT INTO @Results
+                EXEC
+                (
+                    'USE ' + @databaseName + '
+                    SELECT ''' + @TableName + ''',''' + @ColumnName + ''',''' + @TableName + '.' + @ColumnName + ''', LEFT(' + @ColumnName + ', 3630) 
+                    FROM ' + @TableName + ' (NOLOCK) ' +
+                    ' WHERE ' + @ColumnName + ' LIKE ' + @SearchStr2
+                )
+            END
+        END
+    END
+
+    --Declaring another temporary table
+    DECLARE @time_to_update TABLE(TableName nvarchar(370), RealColumnName nvarchar(370))
+
+    INSERT INTO @time_to_update
+    SELECT TableName, RealColumnName FROM @Results GROUP BY TableName, RealColumnName
+
+    DECLARE @MyCursor CURSOR;
+    BEGIN
+        DECLARE @t nvarchar(370)
+        DECLARE @c nvarchar(370)
+        --Looping over the search results   
+        SET @MyCursor = CURSOR FOR
+        SELECT TableName, RealColumnName FROM @time_to_update GROUP BY TableName, RealColumnName
+
+        --Getting my variables from the first item
+        OPEN @MyCursor 
+        FETCH NEXT FROM @MyCursor 
+        INTO @t, @c
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            -- Updating the old values with the new value
+            DECLARE @sqlCommand varchar(1000)
+            SET @sqlCommand = '
+                USE ' + @databaseName + '
+                UPDATE [' + @databaseName + '].' + @t + ' SET ' + @c + ' = REPLACE(' + @c + ', ''' + @SearchStr + ''', ''' + @ReplaceStr + ''') 
+                WHERE ' + @c + ' LIKE ''' + @SearchStr2 + ''''
+            PRINT @sqlCommand
+            BEGIN TRY
+                EXEC (@sqlCommand)
+            END TRY
+            BEGIN CATCH
+                PRINT ERROR_MESSAGE()
+            END CATCH
+
+            --Getting next row values
+            FETCH NEXT FROM @MyCursor 
+            INTO @t, @c 
+        END;
+
+        CLOSE @MyCursor ;
+        DEALLOCATE @MyCursor;
+    END;
+
+    DELETE FROM @time_to_update
+    DELETE FROM @Results
+
+    FETCH NEXT FROM db_cursor INTO @databaseName
+END   
+
+CLOSE db_cursor   
+DEALLOCATE db_cursor
